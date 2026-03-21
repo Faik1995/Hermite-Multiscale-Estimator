@@ -1,9 +1,15 @@
 import numpy as np
 import math
+import os
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.integrate import quad
 from scipy.special import hermite
+
+mpl.rcParams["text.usetex"] = False
+mpl.rcParams["font.family"] = "serif"
+mpl.rcParams["mathtext.fontset"] = "cm"
 
 np.random.seed(2025)
 
@@ -53,6 +59,10 @@ rho_e = lambda x: rho_e_(x)/Z_e
 out = rho(points)
 out_e = rho_e(points)
 
+# create data directory if missing
+os.makedirs("data", exist_ok=True)
+os.makedirs("figures", exist_ok=True)
+
 np.savetxt("data/test_NT_homogenized.txt", out)
 np.savetxt("data/test_NT_multiscale_e" + str(epsilon) + ".txt", out_e)
 
@@ -75,8 +85,13 @@ for i in range(len(times)):
         np.savetxt("data/test_NT_N" + str(coeff[j]) + "_e" + str(epsilon) + "_T" + str(times[i]) + ".txt", out_hat)
 
         plt.figure()
-        plt.plot(points, out_e, label='Multiscale')
-        plt.plot(points, out, label='Homogenized')
-        plt.plot(points, out_hat, label='Estimated')
-        plt.title('T = ' + str(times[i]) + ', N = ' + str(coeff[j]))
+        plt.grid(alpha=0.3)
+        plt.plot(points, out_e, label=rf'$\mu_\varepsilon$', color="#e7bf6d", linestyle = '-', linewidth = 2)
+        plt.plot(points, out, label=rf'$\mu$', color='#851e09', linestyle = '--', linewidth = 2)
+        plt.plot(points, out_hat, label=r'$\widehat \mu^\varepsilon_{N, T}$', color='#3754cc', linewidth = 2)
+        plt.title(rf'$T = {times[i]}, N = {coeff[j]}$', fontsize=24)
+        plt.legend(fontsize=18)
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)  
+        plt.savefig("figures/varyNeT_N" + str(coeff[j]) + "_e" + str(epsilon) + "_T" + str(times[i]) + ".pdf", bbox_inches="tight")
         plt.show()

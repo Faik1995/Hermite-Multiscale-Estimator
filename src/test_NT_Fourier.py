@@ -1,14 +1,19 @@
 import numpy as np
 import math
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.special import hermite
+
+mpl.rcParams["text.usetex"] = False
+mpl.rcParams["font.family"] = "serif"
+mpl.rcParams["mathtext.fontset"] = "cm"
 
 np.random.seed(2025)
 
 #%% Data
 
-epsilon = 0.075
+epsilon = 0.1
 
 sigma = 1
 V = lambda x: x**4/4 - x**2/2
@@ -52,6 +57,11 @@ for j in range(len(coeff)):
     np.savetxt("data/test_NT_Fourier_N" + str(coeff[j]) + "_e" + str(epsilon) + "_T" + str(T) + ".txt", out_hat_Fourier)
     
     plt.figure()
-    plt.plot(points, out_hat_Fourier, label='Fourier')
-    plt.title('e = ' + str(epsilon) + ', N = ' + str(coeff[j]))
+    plt.grid(alpha=0.3)
+    plt.plot(points, out_hat_Fourier, label=r'$\mathcal{F}\left(\widehat \mu^\varepsilon_{N, T}\right)$', color='#3754cc', linewidth = 2)
+    plt.title(rf'$\varepsilon = {epsilon}, N = {coeff[j]}$', fontsize=24)
+    plt.legend(fontsize=18)
+    plt.xticks(fontsize=14)
+    plt.yticks(fontsize=14)
+    plt.savefig("figures/varyNeT_Fourier_N" + str(coeff[j]) + "_e" + str(epsilon) + "_T" + str(T) + ".pdf", bbox_inches="tight")
     plt.show()
