@@ -1,0 +1,12 @@
+{
+  "name": "dolfinx",
+  "image": "dolfinx/dolfinx:stable",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ]
+    }
+  }
+}
