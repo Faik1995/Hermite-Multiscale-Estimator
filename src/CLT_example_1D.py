@@ -1,99 +1,291 @@
 import numpy as np
-import math
+from numba import njit, prange
 import matplotlib.pyplot as plt
-from scipy.special import hermite
+from scipy.special import eval_hermite, factorial
 from scipy.integrate import quad
 
 # FEniCSx specific packages
 from mpi4py import MPI              # for parallelism
-from dolfinx import mesh, dolfinx.fem       # creating meshes, dolfinx.fem function spaces, variational forms, etc.
-import dolfinx.fem.petsc            # assembly functions that turn ufl symbolic forms into actual matrices and vectors
+import dolfinx.fem.petsc            # assembly functions that turn ufl symbolic forms into actual matrices and vectors, creating meshes, dolfinx.fem function spaces, variational forms, etc.
 from petsc4py import PETSc          # linear algebra and solver library underneath FEniCSx
 import ufl                          # symbolic language used to write variational forms
 
-def solve_Poisson(domain_cutoff, mesh_number, homog_diffusion, potential, hermite):
 
-    return
+class Poisson1D:
+    def __init__(self, potential, periodic_oscilation, period, sigma, epsilon, domain_cutoff, mesh_number):
 
-N = 1000
-R = 5
+        # homogenized diffusion coefficient
+        Pi_plus = quad(lambda x: np.exp(+periodic_oscilation(x)/(sigma**2)), 0, period)[0]
+        Pi_minus = quad(lambda x: np.exp(-periodic_oscilation(x)/(sigma**2)), 0, period)[0]
+        K = (period**2)/(Pi_plus*Pi_minus)
+        self.homog_diffusion = np.sqrt(2*K*sigma)
 
-domain = mesh.create_interval(MPI.COMM_WORLD, N, [-R, R])                               # define mesh of interval [-R, R]
+        # FEM parameters
+        R = domain_cutoff
+        N = mesh_number
 
-V = dolfinx.fem.functionspace(domain, ("Lagrange", 1))                                          # define finite element space of piecewise linear functions
+        # mesh, finite element space and domain definitions
+        self.domain = dolfinx.mesh.create_interval(MPI.COMM_WORLD, N, [-R, R])             # define mesh of interval [-R, R] with N nodes
+        self.V_h = dolfinx.fem.functionspace(self.domain, ('Lagrange', 1))                                                      # define finite element space of piecewise linear functions
+        x = ufl.SpatialCoordinate(self.domain)                                                                               # spatial coordinate
+        self.dx = ufl.dx(domain=self.domain)                                                                                      # Lebesgue integration measure
 
-x = ufl.SpatialCoordinate(domain)                                                       # spatial coordinate 
-dx = ufl.dx(domain=domain)                                                              # Lebesgue integration measure
+        # Interpolate the large-scale potential into FEM space so we can use it in the FEniCXs setting of FEM and UFL language
+        # Vfun is basically the approximation of V in the finite element space that we defined before
+        V_fem = dolfinx.fem.Function(self.V_h)
+        V_fem.interpolate(lambda x: potential(x[0]))
+        V_potential = V_fem
 
-Sigma = 1
-L = 2*np.pi
-p = lambda x: np.cos(x)
-Pi_plus = quad(lambda x: np.exp(+p(x)/(Sigma**2)), 0, L)[0]
-Pi_minus = quad(lambda x: np.exp(-p(x)/(Sigma**2)), 0, L)[0]
-K = (L**2)/(Pi_plus*Pi_minus)
-bar_Sigma = K*Sigma
+        # Same for the invariant density, first unnormalized, then we normalize in the FEniCXs way
+        mu_fem = dolfinx.fem.Function(self.V_h)
+        mu_fem.interpolate(lambda x: np.exp(-2 * potential(x[0]) / self.homog_diffusion**2))
 
-V_potential = 0.5*x[0]**2
-mu_unnormalized = ufl.exp(-2*V_potential/bar_Sigma**2)                                  # symbolic finite element expression
+        Z_local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(mu_fem*self.dx))    # turn UFL object into DOLFINx object that can be assembled, that is, compute the numerical value of the normalization constant
+        Z = self.domain.comm.allreduce(Z_local, op=MPI.SUM)                                          # due to parallelism, each MPI process owns only part of the mesh, so the assembly initially gives only the local contribution, hence, we add the local contributions from all processes here
+        mu_fem.x.array[:] = mu_fem.x.array[:] / Z                                                            # actually normalize the values
+        mu_fem.x.scatter_forward()                                                      # only for parallelism, synchronize the solution data across MPI processes after the solve
+        self.mu = mu_fem            
 
-Z_local = dolfinx.fem.assemble_scalar(fem.form(mu_unnormalized*dx))                             # turn UFL object into DOLFINx object that can be assembled, that is, compute the numerical value of the normalization constant
-Z = domain.comm.allreduce(Z_local, op=MPI.SUM)                                          # due to parallelism, each MPI process owns only part of the mesh, so the assembly initially gives only the local contribution,
-mu = mu_unnormalized/Z                                                                  # hence, we add the local contributions from all processes here
+        # Same for the multiscale invariant density, first unnormalized, then we normalize in the FEniCXs way
+        mu_eps_fem = dolfinx.fem.Function(self.V_h)
+        mu_eps_fem.interpolate(lambda x: np.exp(-potential(x[0]) / sigma - periodic_oscilation(x[0] / epsilon) / sigma ) )
 
-psi = x[0]
-psi_mean_local = dolfinx.fem.assemble_scalar(fem.form(psi*mu*dx))                               # same as above
-psi_mean = domain.comm.allreduce(psi_mean_local, op=MPI.SUM)
-bar_psi = psi - psi_mean
+        Z_eps_local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(mu_eps_fem*self.dx))
+        Z_eps = self.domain.comm.allreduce(Z_eps_local, op=MPI.SUM)
+        mu_eps_fem.x.array[:] = mu_eps_fem.x.array[:] / Z_eps
+        mu_eps_fem.x.scatter_forward()
+        self.mu_eps = mu_eps_fem  
 
-u = ufl.TrialFunction(V)                                                                # placeholder for unknown solution in V
-v = ufl.TestFunction(V)                                                                 # placeholder for an arbitrary test function in V
+        # trial and test functions of variational formulation
+        u = ufl.TrialFunction(self.V_h)                                                                # placeholder for unknown solution in V
+        self.v = ufl.TestFunction(self.V_h)                                                            # placeholder for an arbitrary test function in V     
 
-a = bar_Sigma**2/2*ufl.inner(mu*ufl.grad(u), ufl.grad(v))*dx                            # bilinear form in variational formulation
-l = bar_psi*v*mu*dx                                                                     # linear form in variational formulation
+        # Bilinear form of variational formulation
+        a = self.homog_diffusion**2/2*ufl.inner(self.mu*ufl.grad(u), ufl.grad(self.v))*self.dx                            # ufl expression, i.e., symbolic finite element expression
+        a_form = dolfinx.fem.form(a)                                                                    # again, this wraps the symbolic UFL forms into DOLFINx forms that can be assembled
 
-a_form = dolfinx.fem.form(a)                                                                    # again, this wraps the symbolic UFL forms into DOLFINx forms that can be assembled
-l_form = dolfinx.fem.form(l)
+        # boundary condition
+        bcs = []                                                                                # weak form uses only the natural boundary conditions, that is, zero-flux condition mu*Phi' = 0, or, in other words, nothing important leaves the boundary and the weak formulation already encodes the boundary condition
 
-bcs = []                                                                                # weak form uses only the natural boundary conditions, that is, zero-flux condition mu*Phi' = 0, or, in other words, nothing important leaves the boundary and the weak formulation already encodes the boundary condition
+        # stiffness matrix
+        A = dolfinx.fem.petsc.assemble_matrix(a_form, bcs=bcs)                                  # assemble the stiffness matrix
+        A.assemble()  
 
-A = dolfinx.fem.petsc.assemble_matrix(a_form, bcs=bcs)                                  # assemble the stiffness matrix
-A.assemble()                                                                              
+        # nullspace definition
+        nullspace = PETSc.NullSpace().create(constant=True, comm=self.domain.comm)                   # since our Poisson problem is singular (constants are in the kernel of the generator and the stiffness matrix), we must specify this nullspace of constants
+        A.setNullSpace(nullspace)
 
-b = dolfinx.fem.petsc.assemble_vector(l_form)                                           # assemble the load vector
-b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
+        # Solver configuration and definition
+        petsc_options = {                                                                       # configuring a direct solver (MUMPS)
+            "ksp_error_if_not_converged": True,                                                 # give error if not converging
+            "ksp_type": "preonly",                                                              # precondition only once since we use direct solver through factorization
+            "pc_type": "lu",                                                                    # use LU factorization 
+            "pc_factor_mat_solver_type": "mumps",                                               # MUMPS is a parallel sparse direct solver that does the LU factorization
+            "ksp_monitor": None,                                                                # solver progress information is turned off
+        }
 
-nullspace = PETSc.NullSpace().create(constant=True, comm=domain.comm)                   # since our Poisson problem is singular (constants are in the kernel of the generator and the stiffness matrix), we must specify this nullspace of constants
-assert nullspace.test(A)                                                                # test that it is indeed nullspace of A
-A.setNullSpace(nullspace)
+        ksp = PETSc.KSP().create(self.domain.comm)                                                   # creating the Krylov subspace solver
+        ksp.setOptionsPrefix("singular_direct")                                                 # giving own namespace to the solver, so the options only apply to our specified solver
+        opts = PETSc.Options()                                                                  # PETSc options database
+        opts.prefixPush(ksp.getOptionsPrefix())
+        for key, value in petsc_options.items():                                                # loops over the dictionary and writes each option into the PETSc options database under the active prefix
+            opts[key] = value                                                                   # e.g. singular_direct_ksp_error_if_not_converged = True
+        ksp.setFromOptions()                                                                    # apply options to our solver
+        for key, value in petsc_options.items():                                                # cleanup of solver options
+            del opts[key]
+        opts.prefixPop()
+        ksp.setOperators(A)                                                                     # telling the solver which matrix to solve with
+        self.ksp = ksp
 
-petsc_options = {                                                                       # configuring a direct solver (MUMPS)
-    "ksp_error_if_not_converged": True,                                                 # give error if not converging
-    "ksp_type": "preonly",                                                              # precondition only once since we use direct solver through factorization
-    "pc_type": "lu",                                                                    # use LU factorization 
-    "pc_factor_mat_solver_type": "mumps",                                               # MUMPS is a parallel sparse direct solver that does the LU factorization
-    "ksp_monitor": None,                                                                # solver progress information is turned off
-}
+    # interpolate a given Python callable function f into FEM space so we can use it in the FEniCXs setting of FEM and UFL language
+    def interpolate(self, f):
+        f_fem = dolfinx.fem.Function(self.V_h)
+        f_fem.interpolate(lambda x: f(x[0]))
+        return f_fem
+    
+    # calculate the integral of a finite element function f_fem with repect to invariant density mu in the FEniCSx way
+    def mu_mean(self, f_fem):
+        mean_local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(f_fem * self.mu * self.dx))
+        mean = self.domain.comm.allreduce(mean_local, op=MPI.SUM)
+        return mean
+    
+    # solve the Poisson equation for given Python callable function psi
+    def solve(self, psi):
 
-ksp = PETSc.KSP().create(domain.comm)                                                   # creating the Krylov subspace solver
-ksp.setOptionsPrefix("singular_direct")                                                 # giving own namespace to the solver, so the options only apply to our specified solver
-opts = PETSc.Options()                                                                  # PETSc options database
-opts.prefixPush(ksp.getOptionsPrefix())
-for key, value in petsc_options.items():                                                # loops over the dictionary and writes each option into the PETSc options database under the active prefix
-    opts[key] = value                                                                   # e.g. singular_direct_ksp_error_if_not_converged = True
-ksp.setFromOptions()                                                                    # apply options to our solver
-for key, value in petsc_options.items():                                                # cleanup of solver options
-    del opts[key]
-opts.prefixPop()
+        # interpolate psi into FEM space with previous method
+        psi_fem = self.interpolate(psi)
 
-ksp.setOperators(A)                                                                     # telling the solver which matrix to solve with
+        # subtract the mean to get a centered RHS of the Poisson equation
+        psi_mean = self.mu_mean(psi_fem)
 
-u_h = dolfinx.fem.Function(V)                                                           # define dolfinx.fem solution
-ksp.solve(b, u_h.x.petsc_vec)                                                           # solve the linear system
-u_h.x.scatter_forward()                                                                 # only for parallelism, synchronize the solution data across MPI processes after the solve
+        bar_psi_fem = dolfinx.fem.Function(self.V_h)
+        bar_psi_fem.x.array[:] = psi_fem.x.array - psi_mean
+        bar_psi_fem.x.scatter_forward()
 
-u_mean_local = dolfinx.fem.assemble_scalar(fem.form(u_h*mu*dx))                                 # subtract mean from solution to fix a unique solution, this is the necessary boundary condition for the Poisson equation
-u_mean = domain.comm.allreduce(u_mean_local, op=MPI.SUM)
+        # linear form in variational formulation
+        l = bar_psi_fem * self.v * self.mu * self.dx                 
+        l_form = dolfinx.fem.form(l)                                 # again, this wraps the symbolic UFL forms into DOLFINx forms that can be assembled                                                                             
 
-u_h.x.array[:] -= u_mean
-u_h.x.scatter_forward()
+        # RHS
+        b = dolfinx.fem.petsc.assemble_vector(l_form)                                           # assemble the load vector
+        b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)         # parallel stuff again
 
+        # compute the FEM solution
+        Phi_h = dolfinx.fem.Function(self.V_h)                                                           # define dolfinx.fem solution
+        self.ksp.solve(b, Phi_h.x.petsc_vec)                                                                 # solve the linear system
+        Phi_h.x.scatter_forward()                                                                 # only for parallelism, synchronize the solution data across MPI processes after the solve
+
+        Phi_h.x.array[:] = Phi_h.x.array[:] - self.mu_mean(Phi_h)                 # subtract mean from solution to fix a unique solution, this is the necessary normalization condition for the Poisson equation
+        Phi_h.x.scatter_forward()
+
+        return Phi_h             
+
+    # compute the Dirichlet form associated with the generator L in FEniCXs style
+    def dirichlet_form(self, f_fem, g_fem):
+        integral_local = dolfinx.fem.assemble_scalar(
+            dolfinx.fem.form(
+            (self.homog_diffusion**2 / 2) * ufl.inner(ufl.grad(f_fem), ufl.grad(g_fem)) * self.mu * self.dx)
+            )
+        integral = self.domain.comm.allreduce(integral_local, op=MPI.SUM)
+
+        return integral
+
+# Multiscale overdamped Langevin equation with linear drift and cosine oscillation
+Poisson_linear_drift = Poisson1D(
+    potential = lambda x: x**2/2,
+    periodic_oscilation = lambda x: np.cos(x),
+    sigma = 1,
+    period = 2*np.pi,
+    epsilon = 0.1,
+    domain_cutoff = 3,
+    mesh_number = 1000
+)                                        
+
+# Hermite basis functions, n and x can both be arrays/lists or just scalars nphere
+def psi(n, x):
+    n_scalar = np.isscalar(n)
+    x_scalar = np.isscalar(x)
+
+    n = np.atleast_1d(n)
+    x = np.atleast_1d(x)
+
+    # make shapes broadcast as (len(n), len(x))
+    n2 = n[:, None]
+    x2 = x[None, :]
+
+    normalization = 1.0 / np.sqrt(
+        np.sqrt(np.pi) * (2.0 ** n2) * factorial(n2)
+    )
+
+    result = normalization * eval_hermite(n2, x2) * np.exp(-x2**2 / 2)
+
+    # return shape depending on scalar/array input
+    if n_scalar and x_scalar:
+        return result[0, 0]
+    elif n_scalar:
+        return result[0, :]
+    elif x_scalar:
+        return result[:, 0]
+    else:
+        return result
+
+mesh = Poisson_linear_drift.domain.geometry.x[:,0]                                                              # mesh for different purposes, integration, plotting etc.
+M = 16                                                                                                  # Fourier coefficient cutoff for the Gaussian limit element
+S = 10                                                                                                # number of samples for the Gaussian limit element
+Phi_solutions = [Poisson_linear_drift.solve(lambda x: psi(n,x)) for n in range(M)]                              # list of Poisson equation solutions with RHS given by weighted Hermite basis function 
+
+# asymptotic covariance matrix
+tau = np.zeros((M, M))
+for n in range(M):
+    for m in range(n, M):
+        tau[n,m] = 2 * Poisson_linear_drift.dirichlet_form(Phi_solutions[n], Phi_solutions[m])
+tau = (tau + tau.T)/2
+
+# Fourier coefficients of the Gaussian limit element
+csi = np.random.multivariate_normal(np.zeros(M), tau, S)
+
+# Samples of the Gaussian limit element;
+# (G(x))_s = sum_0^M csi(s, m) psi(m, x), so it is just matrix multiplication where each row corresponds to one sample;
+# x can be an array, everything is vectorized
+def G(x):
+    m = np.arange(M)
+    return csi @ psi(m, x)
+
+mu_points = Poisson_linear_drift.mu.x.array
+mu_eps_points = Poisson_linear_drift.mu_eps.x.array
+T = 5000
+
+plt.figure()
+plt.grid()
+for s in range(S):
+    plt.plot(mesh, mu_points + G(mesh)[s,:]/np.sqrt(T), color="#9BD2D4", linewidth=1)
+plt.plot(mesh, mu_points, color='#851e09', linewidth=1.5)
+plt.plot(mesh, mu_eps_points, color="#D5A927", linewidth=1.5)
+plt.show()
+
+plt.figure()
+plt.grid()
+for s in range(S):
+    plt.plot(mesh, G(mesh)[s,:]/np.sqrt(T), color='lightblue', linewidth=1)
+plt.show()
+
+# Numba-jitted functions so we can simulate trajectories faster
+@njit
+def dV(x):
+    return x
+
+@njit
+def dp(x):
+    return -np.sin(x)
+    
+# initial_conditions must be an array, e.g., the same array entry repeated for 10 times would simulate 10 paths from the same SDE 
+@njit(parallel=True)
+def simulate(initial_conditions, T, sigma, eps):
+    dt = eps**2
+    N = int(np.ceil(T / dt))
+    S = len(initial_conditions)
+
+    X = np.empty((S, N+1))
+    X[:,0] = initial_conditions
+
+    inv_eps = 1.0 / eps
+    sqrt_2sigma_dt = np.sqrt(2.0 * sigma * dt)
+        
+    for s in prange(S):
+        for n in range(N):
+            X[s, n+1] = X[s, n] - dV(X[s, n])*dt - inv_eps*dp(X[s, n] * inv_eps)*dt + sqrt_2sigma_dt*np.random.normal()
+
+    return X
+
+class Langevin1D:
+    def __init__(self, sigma, epsilon):
+        self.sigma = sigma
+        self.eps = epsilon
+
+    def trajectory(self, initial_conditions, time_horizon):
+        initial_conditions = np.atleast_1d(np.asarray(initial_conditions, dtype=np.float64))
+        return simulate(initial_conditions, time_horizon, self.sigma, self.eps)
+    
+# Multiscale overdamped Langevin equation with linear drift and cosine oscillation
+Langevin_linear_drift = Langevin1D(
+    sigma = 1,
+    epsilon = 0.1
+) 
+
+data = Langevin_linear_drift.trajectory(np.full((S,), 1.0), 1000)
+
+emp_psi_means = np.empty((S, M))
+for s in range(S):
+    emp_psi_means[s,:] = np.mean(psi(np.arange(M), data[s]), axis=1)
+
+def mu_hat(x):
+    m = np.arange(M)
+    return emp_psi_means @ psi(m, x)
+
+plt.figure()
+plt.grid()
+for s in range(S):
+    plt.plot(mesh, mu_hat(mesh)[s,:], color="#9BD2D4", linewidth=1.5)
+plt.plot(mesh, mu_points, color='#851e09', linewidth=1.5)
+plt.plot(mesh, mu_eps_points, color="#D5A927", linewidth=1.5)
+plt.show()
