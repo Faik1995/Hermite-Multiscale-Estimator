@@ -18,7 +18,7 @@ class Poisson1D:
         Pi_plus = quad(lambda x: np.exp(+periodic_oscilation(x)/(sigma**2)), 0, period)[0]
         Pi_minus = quad(lambda x: np.exp(-periodic_oscilation(x)/(sigma**2)), 0, period)[0]
         K = (period**2)/(Pi_plus*Pi_minus)
-        self.homog_diffusion = np.sqrt(2*K*sigma)
+        self.homog_diffusion = np.sqrt(2*sigma*K)
 
         # FEM parameters
         R = domain_cutoff
@@ -36,22 +36,20 @@ class Poisson1D:
         V_fem.interpolate(lambda x: potential(x[0]))
         V_potential = V_fem
 
-        # Same for the invariant density, first unnormalized, then we normalize in the FEniCXs way
+        # Same for the invariant density, first unnormalized, then we normalize
         mu_fem = dolfinx.fem.Function(self.V_h)
-        mu_fem.interpolate(lambda x: np.exp(-2 * potential(x[0]) / self.homog_diffusion**2))
+        mu_fem.interpolate(lambda x: np.exp(-2 * K * potential(x[0]) / self.homog_diffusion**2))
+        Z = quad(lambda x: np.exp(-2 * K * potential(x) / self.homog_diffusion**2), -np.inf, +np.inf)[0]         # normalization constant
 
-        Z_local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(mu_fem*self.dx))    # turn UFL object into DOLFINx object that can be assembled, that is, compute the numerical value of the normalization constant
-        Z = self.domain.comm.allreduce(Z_local, op=MPI.SUM)                                          # due to parallelism, each MPI process owns only part of the mesh, so the assembly initially gives only the local contribution, hence, we add the local contributions from all processes here
-        mu_fem.x.array[:] = mu_fem.x.array[:] / Z                                                            # actually normalize the values
+        mu_fem.x.array[:] = mu_fem.x.array[:] / Z                                       # actually normalize the values
         mu_fem.x.scatter_forward()                                                      # only for parallelism, synchronize the solution data across MPI processes after the solve
         self.mu = mu_fem            
 
         # Same for the multiscale invariant density, first unnormalized, then we normalize in the FEniCXs way
         mu_eps_fem = dolfinx.fem.Function(self.V_h)
-        mu_eps_fem.interpolate(lambda x: np.exp(-potential(x[0]) / sigma - periodic_oscilation(x[0] / epsilon) / sigma ) )
+        mu_eps_fem.interpolate(lambda x: np.exp(-potential(x[0]) / sigma - periodic_oscilation(x[0] / epsilon) / sigma ))
+        Z_eps = quad(lambda x: np.exp(-potential(x) / sigma - periodic_oscilation(x / epsilon) / sigma ), -np.inf, +np.inf)[0]
 
-        Z_eps_local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(mu_eps_fem*self.dx))
-        Z_eps = self.domain.comm.allreduce(Z_eps_local, op=MPI.SUM)
         mu_eps_fem.x.array[:] = mu_eps_fem.x.array[:] / Z_eps
         mu_eps_fem.x.scatter_forward()
         self.mu_eps = mu_eps_fem  
@@ -105,8 +103,8 @@ class Poisson1D:
     
     # calculate the integral of a finite element function f_fem with repect to invariant density mu in the FEniCSx way
     def mu_mean(self, f_fem):
-        mean_local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(f_fem * self.mu * self.dx))
-        mean = self.domain.comm.allreduce(mean_local, op=MPI.SUM)
+        mean_local = dolfinx.fem.assemble_scalar(dolfinx.fem.form(f_fem * self.mu * self.dx))       # turn UFL object into DOLFINx object that can be assembled, that is, compute the numerical value of the integral
+        mean = self.domain.comm.allreduce(mean_local, op=MPI.SUM)                                   # due to parallelism, each MPI process owns only part of the mesh, so the assembly initially gives only the local contribution, hence, we add the local contributions from all processes here
         return mean
     
     # solve the Poisson equation for given Python callable function psi
@@ -152,47 +150,51 @@ class Poisson1D:
 
 # Multiscale overdamped Langevin equation with linear drift and cosine oscillation
 Poisson_linear_drift = Poisson1D(
-    potential = lambda x: x**2/2,
+    potential = lambda x: x**4/4 - x**2/2,
     periodic_oscilation = lambda x: np.cos(x),
     sigma = 1,
     period = 2*np.pi,
     epsilon = 0.1,
-    domain_cutoff = 3,
+    domain_cutoff = 5,
     mesh_number = 1000
 )                                        
 
-# Hermite basis functions, n and x can both be arrays/lists or just scalars nphere
+# Hermite basis functions, n and x can both be arrays/lists or just scalars here
+# the code looks weird, but it is just because of broadcasting rules in python and because I want to apply 
+# each Hermite function to a whole matrix of data points
 def psi(n, x):
     n_scalar = np.isscalar(n)
     x_scalar = np.isscalar(x)
 
     n = np.atleast_1d(n)
-    x = np.atleast_1d(x)
+    x = np.asarray(x)
 
-    # make shapes broadcast as (len(n), len(x))
-    n2 = n[:, None]
-    x2 = x[None, :]
+    # make n have one extra axis for each axis of x
+    # x scalar  -> n2 shape (M,)
+    # x 1D      -> n2 shape (M,1)
+    # x 2D      -> n2 shape (M,1,1)
+    n2 = n.reshape((len(n),) + (1,) * x.ndim)
 
     normalization = 1.0 / np.sqrt(
         np.sqrt(np.pi) * (2.0 ** n2) * factorial(n2)
     )
 
-    result = normalization * eval_hermite(n2, x2) * np.exp(-x2**2 / 2)
+    result = normalization * eval_hermite(n2, x) * np.exp(-x**2 / 2)
 
     # return shape depending on scalar/array input
     if n_scalar and x_scalar:
-        return result[0, 0]
+        return result[0]
     elif n_scalar:
-        return result[0, :]
+        return result[0]
     elif x_scalar:
-        return result[:, 0]
+        return result[:, ...]
     else:
         return result
 
 mesh = Poisson_linear_drift.domain.geometry.x[:,0]                                                              # mesh for different purposes, integration, plotting etc.
-M = 16                                                                                                  # Fourier coefficient cutoff for the Gaussian limit element
-S = 10                                                                                                # number of samples for the Gaussian limit element
-Phi_solutions = [Poisson_linear_drift.solve(lambda x: psi(n,x)) for n in range(M)]                              # list of Poisson equation solutions with RHS given by weighted Hermite basis function 
+M = 16                                                                                 # Fourier coefficient cutoff for the Gaussian limit element
+S = 500                                                                                                # number of samples for the Gaussian limit element
+Phi_solutions = [Poisson_linear_drift.solve(lambda x, n=n: psi(n,x)) for n in range(M)]                              # list of Poisson equation solutions with RHS given by weighted Hermite basis function 
 
 # asymptotic covariance matrix
 tau = np.zeros((M, M))
@@ -213,7 +215,7 @@ def G(x):
 
 mu_points = Poisson_linear_drift.mu.x.array
 mu_eps_points = Poisson_linear_drift.mu_eps.x.array
-T = 5000
+T = 1000
 
 plt.figure()
 plt.grid()
@@ -232,7 +234,7 @@ plt.show()
 # Numba-jitted functions so we can simulate trajectories faster
 @njit
 def dV(x):
-    return x
+    return x**3 - x
 
 @njit
 def dp(x):
@@ -272,15 +274,16 @@ Langevin_linear_drift = Langevin1D(
     epsilon = 0.1
 ) 
 
-data = Langevin_linear_drift.trajectory(np.full((S,), 1.0), 1000)
+data = Langevin_linear_drift.trajectory(np.full((S,), 1.0), T)
 
-emp_psi_means = np.empty((S, M))
+alpha = np.empty((S, M))
 for s in range(S):
-    emp_psi_means[s,:] = np.mean(psi(np.arange(M), data[s]), axis=1)
+    alpha[s,:] = np.mean(psi(np.arange(M), data[s]), axis=1)
+
+#alpha = np.mean(psi(np.arange(M), data), axis=2).T             # can be used but only for smaller sample sizes S as one runs into memory problems fast
 
 def mu_hat(x):
-    m = np.arange(M)
-    return emp_psi_means @ psi(m, x)
+    return alpha @ psi(np.arange(M), x)
 
 plt.figure()
 plt.grid()
