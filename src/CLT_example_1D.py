@@ -1,8 +1,14 @@
 import numpy as np
 from numba import njit, prange
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from scipy.special import eval_hermite, factorial
 from scipy.integrate import quad
+
+# for font consistency with latex classes
+mpl.rcParams["text.usetex"] = False
+mpl.rcParams["font.family"] = "serif"
+mpl.rcParams["mathtext.fontset"] = "cm"
 
 # FEniCSx specific packages
 from mpi4py import MPI              # for parallelism
@@ -11,6 +17,7 @@ from petsc4py import PETSc          # linear algebra and solver library undernea
 import ufl                          # symbolic language used to write variational forms
 
 
+# defines the general Poisson equation setting and calculates the FEM solution of our singular Poisson equation on the whole line with natural boundary conditions
 class Poisson1D:
     def __init__(self, potential, periodic_oscilation, period, sigma, epsilon, domain_cutoff, mesh_number):
 
@@ -29,6 +36,7 @@ class Poisson1D:
         self.V_h = dolfinx.fem.functionspace(self.domain, ('Lagrange', 1))                                                      # define finite element space of piecewise linear functions
         x = ufl.SpatialCoordinate(self.domain)                                                                               # spatial coordinate
         self.dx = ufl.dx(domain=self.domain)                                                                                      # Lebesgue integration measure
+        self.mesh = self.domain.geometry.x[:,0]                                                 # mesh for different purposes: integration, plotting etc.
 
         # Interpolate the large-scale potential into FEM space so we can use it in the FEniCXs setting of FEM and UFL language
         # Vfun is basically the approximation of V in the finite element space that we defined before
@@ -42,7 +50,7 @@ class Poisson1D:
         Z = quad(lambda x: np.exp(-2 * K * potential(x) / self.homog_diffusion**2), -np.inf, +np.inf)[0]         # normalization constant
 
         mu_fem.x.array[:] = mu_fem.x.array[:] / Z                                       # actually normalize the values
-        mu_fem.x.scatter_forward()                                                      # only for parallelism, synchronize the solution data across MPI processes after the solve
+        mu_fem.x.scatter_forward()                                                      # only for parallelism, synchronize the solution data across MPI processes
         self.mu = mu_fem            
 
         # Same for the multiscale invariant density, first unnormalized, then we normalize in the FEniCXs way
@@ -146,18 +154,7 @@ class Poisson1D:
             )
         integral = self.domain.comm.allreduce(integral_local, op=MPI.SUM)
 
-        return integral
-
-# Multiscale overdamped Langevin equation with linear drift and cosine oscillation
-Poisson_linear_drift = Poisson1D(
-    potential = lambda x: x**4/4 - x**2/2,
-    periodic_oscilation = lambda x: np.cos(x),
-    sigma = 1,
-    period = 2*np.pi,
-    epsilon = 0.1,
-    domain_cutoff = 5,
-    mesh_number = 1000
-)                                        
+        return integral                                     
 
 # Hermite basis functions, n and x can both be arrays/lists or just scalars here
 # the code looks weird, but it is just because of broadcasting rules in python and because I want to apply 
@@ -191,58 +188,67 @@ def psi(n, x):
     else:
         return result
 
-mesh = Poisson_linear_drift.domain.geometry.x[:,0]                                                              # mesh for different purposes, integration, plotting etc.
-M = 16                                                                                 # Fourier coefficient cutoff for the Gaussian limit element
-S = 500                                                                                                # number of samples for the Gaussian limit element
-Phi_solutions = [Poisson_linear_drift.solve(lambda x, n=n: psi(n,x)) for n in range(M)]                              # list of Poisson equation solutions with RHS given by weighted Hermite basis function 
 
-# asymptotic covariance matrix
-tau = np.zeros((M, M))
-for n in range(M):
-    for m in range(n, M):
-        tau[n,m] = 2 * Poisson_linear_drift.dirichlet_form(Phi_solutions[n], Phi_solutions[m])
-tau = (tau + tau.T)/2
+# truncated Gaussian limit element
+class Gaussian_Limit1D:
+    def __init__(self, poisson, fourier_coefficient_number, sample_size):
+        self.poisson = poisson                      # instance of the class Poisson1D
+        self.N = fourier_coefficient_number         # Fourier coefficient cutoff for the Gaussian limit element
+        self.S = sample_size                        # number of samples for the Gaussian limit element
 
-# Fourier coefficients of the Gaussian limit element
-csi = np.random.multivariate_normal(np.zeros(M), tau, S)
+        # NxN-dimensional asymptotic covariance matrix of the truncated Gaussiam limit element
+        Phi_solutions = [self.poisson.solve(lambda x, n=n: psi(n,x)) for n in range(self.N)]         # list of Poisson equation solutions with RHS given by weighted Hermite basis function 
+        tau = np.zeros((self.N, self.N))
+        for n in range(self.N):
+            for m in range(n, self.N):
+                tau[n,m] = 2 * self.poisson.dirichlet_form(Phi_solutions[n], Phi_solutions[m])
 
-# Samples of the Gaussian limit element;
-# (G(x))_s = sum_0^M csi(s, m) psi(m, x), so it is just matrix multiplication where each row corresponds to one sample;
-# x can be an array, everything is vectorized
-def G(x):
-    m = np.arange(M)
-    return csi @ psi(m, x)
+        self.tau = (tau + tau.T)/2
+    
+    # producing samples of the Gaussiam limit element, x can be an array, everything is vectorized
+    def samples(self, x):
+        csi = np.random.multivariate_normal(np.zeros(self.N), self.tau, self.S)                          # Fourier coefficients of the Gaussian limit element
 
-mu_points = Poisson_linear_drift.mu.x.array
-mu_eps_points = Poisson_linear_drift.mu_eps.x.array
-T = 1000
+        return csi @ psi(np.arange(self.N), x)                                                      # (G(x))_s = sum_0^M csi(s, m) psi(m, x), so it is just matrix multiplication where each row corresponds to one sample
+                              
+    def density_plot(self, T):
+        plt.figure()
+        plt.grid(alpha=0.3)
 
-plt.figure()
-plt.grid()
-for s in range(S):
-    plt.plot(mesh, mu_points + G(mesh)[s,:]/np.sqrt(T), color="#9BD2D4", linewidth=1)
-plt.plot(mesh, mu_points, color='#851e09', linewidth=1.5)
-plt.plot(mesh, mu_eps_points, color="#D5A927", linewidth=1.5)
-plt.show()
+        for s in range(self.S):
+            label = r'$\mu + \frac{1}{\sqrt{T}} \Pi_N (\mathbb{G})$' if s == 0 else '_nolegend_'
+            plt.plot(self.poisson.mesh, self.poisson.mu.x.array + self.samples(self.poisson.mesh)[s,:]/np.sqrt(T), label=label, color="#9BD2D4", linewidth=1)
 
-plt.figure()
-plt.grid()
-for s in range(S):
-    plt.plot(mesh, G(mesh)[s,:]/np.sqrt(T), color='lightblue', linewidth=1)
-plt.show()
+        plt.plot(self.poisson.mesh, self.poisson.mu.x.array, label=r'$\mu$',  color='#851e09', linestyle = '--', linewidth=2)
+        plt.plot(self.poisson.mesh, self.poisson.mu_eps.x.array, label=r'$\mu_\varepsilon$', color="#e7bf6d", linestyle = '-', linewidth=2)
 
-# Numba-jitted functions so we can simulate trajectories faster
-@njit
-def dV(x):
-    return x**3 - x
+        plt.title(rf'$T = {T}, N = {self.N}$', fontsize=24)
+        plt.legend(fontsize=18)
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)  
 
-@njit
-def dp(x):
-    return -np.sin(x)
+        plt.legend()
+        plt.show()
+
+    def sample_plot(self):
+        plt.figure()
+        plt.grid(alpha=0.3)
+
+        for s in range(self.S):
+            label = r'$\Pi_N (\mathbb{G})$' if s == 0 else '_nolegend_'
+            plt.plot(self.poisson.mesh, self.samples(self.poisson.mesh)[s,:], label=label, color="#9BD2D4", linewidth=1)
+
+        plt.title(rf'$S = {self.S}$' + ' samples with ' + rf'$N = {self.N}$', fontsize=24)
+        plt.legend(fontsize=18)
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+
+        plt.legend()
+        plt.show()
     
 # initial_conditions must be an array, e.g., the same array entry repeated for 10 times would simulate 10 paths from the same SDE 
 @njit(parallel=True)
-def simulate(initial_conditions, T, sigma, eps):
+def simulate(initial_conditions, T, sigma, eps, dV, dp):
     dt = eps**2
     N = int(np.ceil(T / dt))
     S = len(initial_conditions)
@@ -260,35 +266,109 @@ def simulate(initial_conditions, T, sigma, eps):
     return X
 
 class Langevin1D:
-    def __init__(self, sigma, epsilon):
+    # dV and dp must be Numba-jitted functions if we want speedy sample generation, e.g.,
+    # @njit
+    # def dV(x):
+    #   return x**3 - x
+    def __init__(self, sigma, epsilon, potential_deriv, periodic_oscilation_deriv):
         self.sigma = sigma
         self.eps = epsilon
+        self.dV = potential_deriv
+        self.dp = periodic_oscilation_deriv
 
     def trajectory(self, initial_conditions, time_horizon):
         initial_conditions = np.atleast_1d(np.asarray(initial_conditions, dtype=np.float64))
-        return simulate(initial_conditions, time_horizon, self.sigma, self.eps)
-    
-# Multiscale overdamped Langevin equation with linear drift and cosine oscillation
-Langevin_linear_drift = Langevin1D(
+        return simulate(initial_conditions, time_horizon, self.sigma, self.eps, self.dV, self.dp)    
+
+# Hermite estimator
+def mu_hat(data, N, x):
+    S = len(data)
+    alpha = np.empty((S, N))
+    for s in range(S):
+        alpha[s,:] = np.mean(psi(np.arange(N), data[s]), axis=1)
+    #alpha = np.mean(psi(np.arange(N), data), axis=2).T             # can be used but only for smaller sample sizes S as one runs into memory problems fast
+    return alpha @ psi(np.arange(N), x)
+
+
+###########################
+## small robustness test ##
+###########################
+
+# Multiscale overdamped Langevin equation
+Poisson = Poisson1D(
+    potential = lambda x: x**6/6 + x**4/4 - x**2/2 - x,
+    periodic_oscilation = lambda x: np.cos(x),
     sigma = 1,
-    epsilon = 0.1
+    period = 2*np.pi,
+    epsilon = 0.1,
+    domain_cutoff = 3,
+    mesh_number = 1000
+)   
+
+# Gaussian limit element corresponding to multiscale overdamped Langevin equation
+Gaussian = Gaussian_Limit1D(
+    poisson = Poisson,
+    fourier_coefficient_number = 16,
+    sample_size = 100
+)     
+    
+# Multiscale overdamped Langevin equation with Numba-jitted drift
+@njit
+def dV(x):
+    return x**5 + x**3 - x - 1
+
+@njit
+def dp(x):
+    return -np.sin(x)
+
+Langevin = Langevin1D(
+    sigma = 1,
+    epsilon = 0.1,
+    potential_deriv = dV,
+    periodic_oscilation_deriv = dp
 ) 
 
-data = Langevin_linear_drift.trajectory(np.full((S,), 1.0), T)
+S = Gaussian.S
+N = Gaussian.M
+T = 1000
+data = Langevin.trajectory(initial_conditions=np.full(S, 1.0), time_horizon=T)
 
-alpha = np.empty((S, M))
-for s in range(S):
-    alpha[s,:] = np.mean(psi(np.arange(M), data[s]), axis=1)
-
-#alpha = np.mean(psi(np.arange(M), data), axis=2).T             # can be used but only for smaller sample sizes S as one runs into memory problems fast
-
-def mu_hat(x):
-    return alpha @ psi(np.arange(M), x)
+mu_hat_estimates = mu_hat(data, N, Poisson.mesh)
 
 plt.figure()
-plt.grid()
+plt.grid(alpha=0.3)
+
 for s in range(S):
-    plt.plot(mesh, mu_hat(mesh)[s,:], color="#9BD2D4", linewidth=1.5)
-plt.plot(mesh, mu_points, color='#851e09', linewidth=1.5)
-plt.plot(mesh, mu_eps_points, color="#D5A927", linewidth=1.5)
+    label = r'$\widehat \mu^\varepsilon_{N, T}$' if s == 0 else '_nolegend_'
+    plt.plot(Poisson.mesh, mu_hat_estimates[s], label=label, color="#b4c2fa", linewidth=1)
+
+plt.plot(Poisson.mesh, Poisson.mu.x.array, label=r'$\mu$',  color='#851e09', linestyle = '--', linewidth=2)
+plt.plot(Poisson.mesh, Poisson.mu_eps.x.array, label=r'$\mu_\varepsilon$', color="#e7bf6d", linestyle = '-', linewidth=2)
+
+plt.title(rf'$T = {T}, \, N = {N}, \, \varepsilon = {Langevin.eps}$', fontsize=24)
+plt.legend(fontsize=18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)  
+
+plt.legend()
+plt.show()
+
+G_samples = Gaussian.samples(Poisson.mesh)
+
+plt.figure()
+plt.grid(alpha=0.3)
+
+for s in range(S):
+    label = r'$\sqrt{T} (\widehat \mu^\varepsilon_{N, T} - \mu)$' if s == 0 else '_nolegend_'
+    plt.plot(Poisson.mesh, np.sqrt(T) * (mu_hat_estimates[s] - Poisson.mu.x.array), label=label, color="#b4c2fa", linewidth=1)
+
+    label = r'$\Pi_N (\mathbb{G})$' if s == 0 else '_nolegend_'
+    plt.plot(Poisson.mesh, Gaussian.samples(Poisson.mesh)[s], label=label, color="#9BD2D4", linewidth=1)
+
+plt.title(rf'$T = {T}, \, N = {N}, \, \varepsilon = {Langevin.eps}$', fontsize=24)
+plt.legend(fontsize=18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)  
+
+plt.legend()
 plt.show()
