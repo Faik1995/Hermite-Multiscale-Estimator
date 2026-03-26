@@ -7,7 +7,6 @@ from scipy.special import hermite
 from scipy.stats import chi2, norm
 
 np.random.seed(2026)
-
 #%% Poisson problem
 
 def solve_Poisson(R, h, c, rho, psi):
@@ -133,8 +132,9 @@ for m in tqdm(range(M)):
 tau = np.zeros((M, M))
 for m1 in range(M):
     for m2 in range(m1, M):
-        tau[m1,m2] = 2*Sigma*np.dot(phis[:,m1], np.dot(A, phis[:,m2]))
-tau = (tau + tau.T)/2
+        val = 2*Sigma*np.dot(phis[:,m1], np.dot(A, phis[:,m2]))
+        tau[m1,m2] = val
+        tau[m2,m1] = val
         
 csi = np.random.multivariate_normal(np.zeros(M), tau, S)
 
@@ -193,3 +193,4 @@ plt.figure()
 plt.hist(z, density=True)
 plt.plot(grid, norm.pdf(grid, 0, 1))
 plt.show()
+# %%
