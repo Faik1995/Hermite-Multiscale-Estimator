@@ -2,8 +2,10 @@ import numpy as np
 from numba import njit, prange
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 from scipy.special import eval_hermite, factorial
 from scipy.integrate import quad
+from scipy.stats import norm
 
 # for font consistency with latex classes
 mpl.rcParams["text.usetex"] = False
@@ -201,23 +203,27 @@ class Gaussian_Limit1D:
         tau = np.zeros((self.N, self.N))
         for n in range(self.N):
             for m in range(n, self.N):
-                tau[n,m] = 2 * self.poisson.dirichlet_form(Phi_solutions[n], Phi_solutions[m])
+                val = 2 * self.poisson.dirichlet_form(Phi_solutions[n], Phi_solutions[m])
+                tau[n,m] = val
+                tau[m,n] = val
 
-        self.tau = (tau + tau.T)/2
+        self.tau = tau
     
-    # producing samples of the Gaussiam limit element, x can be an array, everything is vectorized
+    # producing samples of the Gaussian limit element, x can be an array, everything is vectorized
     def samples(self, x):
         csi = np.random.multivariate_normal(np.zeros(self.N), self.tau, self.S)                          # Fourier coefficients of the Gaussian limit element
 
         return csi @ psi(np.arange(self.N), x)                                                      # (G(x))_s = sum_0^M csi(s, m) psi(m, x), so it is just matrix multiplication where each row corresponds to one sample
                               
     def density_plot(self, T):
-        plt.figure()
+        plt.figure(figsize=(8, 6))
         plt.grid(alpha=0.3)
+
+        G_samples = self.samples(self.poisson.mesh)
 
         for s in range(self.S):
             label = r'$\mu + \frac{1}{\sqrt{T}} \Pi_N (\mathbb{G})$' if s == 0 else '_nolegend_'
-            plt.plot(self.poisson.mesh, self.poisson.mu.x.array + self.samples(self.poisson.mesh)[s,:]/np.sqrt(T), label=label, color="#9BD2D4", linewidth=1)
+            plt.plot(self.poisson.mesh, self.poisson.mu.x.array + G_samples[s]/np.sqrt(T), label=label, color="#9BD2D4", linewidth=1)
 
         plt.plot(self.poisson.mesh, self.poisson.mu.x.array, label=r'$\mu$',  color='#851e09', linestyle = '--', linewidth=2)
         plt.plot(self.poisson.mesh, self.poisson.mu_eps.x.array, label=r'$\mu_\varepsilon$', color="#e7bf6d", linestyle = '-', linewidth=2)
@@ -231,25 +237,27 @@ class Gaussian_Limit1D:
         plt.show()
 
     def sample_plot(self):
-        plt.figure()
+        plt.figure(figsize=(10, 6))
         plt.grid(alpha=0.3)
+
+        G_samples = self.samples(self.poisson.mesh)
+        colors = plt.cm.jet(np.linspace(0, 1, self.S))          # cycle through colors because pretty
 
         for s in range(self.S):
             label = r'$\Pi_N (\mathbb{G})$' if s == 0 else '_nolegend_'
-            plt.plot(self.poisson.mesh, self.samples(self.poisson.mesh)[s,:], label=label, color="#9BD2D4", linewidth=1)
+            plt.plot(self.poisson.mesh, G_samples[s], label=label, color=colors[s], alpha=0.4, linewidth=1)
 
-        plt.title(rf'$S = {self.S}$' + ' samples with ' + rf'$N = {self.N}$', fontsize=24)
-        plt.legend(fontsize=18)
+        plt.title(rf'$S = {self.S}$' + ' samples of ' + r'$\Pi_N (\mathbb{G})$' + ' with ' + rf'$N = {self.N}$', fontsize=24)
         plt.xticks(fontsize=14)
         plt.yticks(fontsize=14)
 
-        plt.legend()
+        #plt.savefig("./figures/gaussian_process_samples_N_50.pdf", bbox_inches="tight")
         plt.show()
     
 # initial_conditions must be an array, e.g., the same array entry repeated for 10 times would simulate 10 paths from the same SDE 
 @njit(parallel=True)
 def simulate(initial_conditions, T, sigma, eps, dV, dp):
-    dt = eps**2
+    dt = eps**3             # higher value than this would create some annoying discretization errors in the simulation
     N = int(np.ceil(T / dt))
     S = len(initial_conditions)
 
@@ -282,21 +290,21 @@ class Langevin1D:
 
 # Hermite estimator
 def mu_hat(data, N, x):
-    S = len(data)
-    alpha = np.empty((S, N))
-    for s in range(S):
-        alpha[s,:] = np.mean(psi(np.arange(N), data[s]), axis=1)
-    #alpha = np.mean(psi(np.arange(N), data), axis=2).T             # can be used but only for smaller sample sizes S as one runs into memory problems fast
+    #S = len(data)
+    #alpha = np.empty((S, N))
+    #for s in tqdm(range(S)):
+    #    alpha[s,:] = np.mean(psi(np.arange(N), data[s]), axis=1)
+    alpha = np.mean(psi(np.arange(N), data), axis=2).T             # can be used but only for smaller arrays, e.g., smaller sample sizes S or coarser discretization of the SDE, as one runs into memory problems fast
     return alpha @ psi(np.arange(N), x)
 
 
-###########################
-## small robustness test ##
-###########################
+############################
+## small robustness tests ##
+############################
 
-# Multiscale overdamped Langevin equation
+# Poisson solution corresponding to multiscale overdamped Langevin equation model
 Poisson = Poisson1D(
-    potential = lambda x: x**6/6 + x**4/4 - x**2/2 - x,
+    potential = lambda x: x**6/6 - x**5/5 + x,
     periodic_oscilation = lambda x: np.cos(x),
     sigma = 1,
     period = 2*np.pi,
@@ -305,17 +313,17 @@ Poisson = Poisson1D(
     mesh_number = 1000
 )   
 
-# Gaussian limit element corresponding to multiscale overdamped Langevin equation
+# Gaussian limit element corresponding to multiscale overdamped Langevin equation model
 Gaussian = Gaussian_Limit1D(
     poisson = Poisson,
     fourier_coefficient_number = 16,
-    sample_size = 100
+    sample_size = 500
 )     
     
-# Multiscale overdamped Langevin equation with Numba-jitted drift
+# Multiscale overdamped Langevin equation model with Numba-jitted drift
 @njit
 def dV(x):
-    return x**5 + x**3 - x - 1
+    return x**5 - x**4 + 1
 
 @njit
 def dp(x):
@@ -326,16 +334,106 @@ Langevin = Langevin1D(
     epsilon = 0.1,
     potential_deriv = dV,
     periodic_oscilation_deriv = dp
-) 
+)
 
-S = Gaussian.S
-N = Gaussian.M
-T = 1000
-data = Langevin.trajectory(initial_conditions=np.full(S, 1.0), time_horizon=T)
+#################################################
+## Fourier coefficient-based tests for the CLT ##
+#################################################
 
-mu_hat_estimates = mu_hat(data, N, Poisson.mesh)
+#fourier_modes = np.arange(0, 16, 2)
+#fourier_modes = np.arange(10, 16, 2)
+#fourier_modes = np.arange(11, 16, 2)
+fourier_modes = np.arange(0, 2)
 
-plt.figure()
+S = Gaussian.S          # sample size
+T = 1000                # observation time
+
+batches = 20
+batch_size = S // batches
+
+x0 = 1.0
+initial_conditions = np.full(S, x0)
+
+# estimates of the Fourier coefficients of mu with respect to hermite function
+alpha_hat = np.empty((len(fourier_modes), S))
+
+# serve the data in appropriate batches to avoid memory problems and kernel crashing
+for b in tqdm(range(batches)):
+    start = b * batch_size
+    stop = (b + 1) * batch_size
+    batch_init_cond = initial_conditions[start:stop]
+
+    data_batch = Langevin.trajectory(batch_init_cond, time_horizon=T)
+    alpha_hat[:, start:stop] = np.mean(psi(fourier_modes, data_batch), axis=2)
+
+# true Fourier coefficients of mu
+def alpha(modes):
+    psi_fem = [Poisson.interpolate(lambda x, n=n: psi(n, x)) for n in modes]
+    psi_mean = [Poisson.mu_mean(psi_n_fem) for psi_n_fem in psi_fem]
+    return np.array(psi_mean).reshape(len(modes), 1)
+
+emp_coeffs = np.sqrt(T) * (alpha_hat - alpha(fourier_modes))
+
+fig, axs = plt.subplots(figsize = (8, 24), 
+                        nrows=len(fourier_modes), 
+                        layout="constrained", 
+                        gridspec_kw={"hspace": 0.1})
+
+for row, mode in enumerate(fourier_modes):
+        x = emp_coeffs[row]
+        ax = axs[row]
+
+        tau_nn = np.diag(Gaussian.tau)[mode]
+
+        # Center plotting window around 0 using the theoretical std
+        x_left = min(x.min(), -4*np.sqrt(tau_nn))
+        x_right = max(x.max(), 4*np.sqrt(tau_nn))
+        xs = np.linspace(x_left, x_right, 400)
+
+        ax.hist(x, bins=40, density=True, color = "#b4c2fa")
+        ax.plot(xs, norm.pdf(xs, loc=0.0, scale=np.sqrt(tau_nn)), 
+                color = "#6A1F50", linestyle = '--',
+                label=rf"$\langle \mathbb{{G}}, \psi_{{{mode}}} \rangle_{{L^2(\mathbb{{R}})}} \sim \mathcal{{N}}_1(0,\tau_{{{mode}, {mode}}})$")
+        
+        ax.grid(alpha=0.3)
+        ax.set_title(rf"$\langle \sqrt{{T}} (\widehat \mu^\varepsilon_{{N, T}} - \mu) , \psi_{{{mode}}} \rangle_{{L^2(\mathbb{{R}})}}$")
+        ax.legend()
+        
+#fig.suptitle(r"Fourier coefficient estimates for $\varepsilon = 0.1$")
+fig.suptitle(r"Fourier coefficient estimates for $\varepsilon = 0.05$")
+#fig.savefig("./figures/fourier_coeff_even_clt_eps_01_N_16.pdf", bbox_inches="tight")
+#fig.savefig("./figures/fourier_coeff_odd_last_3_clt_eps_01_N_16.pdf", bbox_inches="tight")
+#fig.savefig("./figures/fourier_coeff_even_last_3_clt_eps_005_N_16.pdf", bbox_inches="tight")
+#fig.savefig("./figures/fourier_coeff_odd_last_3_clt_eps_005_N_16.pdf", bbox_inches="tight")
+
+##################################
+## further distributional plots ##
+##################################
+
+N = 16                  # number of Fourier coefficients in estimator
+S = 100                 # sample size, don't need that much here anyway
+m = len(Poisson.mesh)   # discretization number of mesh
+T = 1000                # observation time
+
+batches = 10
+batch_size = S // batches
+
+x0 = 1.0
+initial_conditions = np.full(S, x0)
+
+# estimates of the Fourier coefficients of mu with respect to hermite function
+mu_hat_estimates = np.empty((S, m))
+
+# serve the data in appropriate batches to avoid memory problems and kernel crashing
+for b in tqdm(range(batches)):
+    start = b * batch_size
+    stop = (b + 1) * batch_size
+    batch_init_cond = initial_conditions[start:stop]
+
+    data_batch = Langevin.trajectory(batch_init_cond, time_horizon=T)
+    mu_hat_estimates[start:stop, :] = mu_hat(data_batch, N, Poisson.mesh)
+
+plt.figure(figsize=(8, 6))
 plt.grid(alpha=0.3)
 
 for s in range(S):
@@ -345,30 +443,36 @@ for s in range(S):
 plt.plot(Poisson.mesh, Poisson.mu.x.array, label=r'$\mu$',  color='#851e09', linestyle = '--', linewidth=2)
 plt.plot(Poisson.mesh, Poisson.mu_eps.x.array, label=r'$\mu_\varepsilon$', color="#e7bf6d", linestyle = '-', linewidth=2)
 
-plt.title(rf'$T = {T}, \, N = {N}, \, \varepsilon = {Langevin.eps}$', fontsize=24)
+plt.suptitle(rf'$T = {T}, \, N = {N}, \, \varepsilon = {Langevin.eps}$', fontsize=24)
 plt.legend(fontsize=18)
 plt.xticks(fontsize=14)
 plt.yticks(fontsize=14)  
 
+plt.title(r"$V(x) = x^4/4 - x^2/2$", fontsize = 18)
+
 plt.legend()
+#plt.savefig("./figures/estimator_density_distributions_2.pdf", bbox_inches="tight")
 plt.show()
 
 G_samples = Gaussian.samples(Poisson.mesh)
 
-plt.figure()
+plt.figure(figsize=(8, 6))
 plt.grid(alpha=0.3)
 
 for s in range(S):
-    label = r'$\sqrt{T} (\widehat \mu^\varepsilon_{N, T} - \mu)$' if s == 0 else '_nolegend_'
+    label = r'$\Pi_N( \sqrt{T} (\widehat \mu^\varepsilon_{N, T} - \mu))$' if s == 0 else '_nolegend_'
     plt.plot(Poisson.mesh, np.sqrt(T) * (mu_hat_estimates[s] - Poisson.mu.x.array), label=label, color="#b4c2fa", linewidth=1)
 
     label = r'$\Pi_N (\mathbb{G})$' if s == 0 else '_nolegend_'
-    plt.plot(Poisson.mesh, Gaussian.samples(Poisson.mesh)[s], label=label, color="#9BD2D4", linewidth=1)
+    plt.plot(Poisson.mesh, G_samples[s], label=label, color="#6A1F50", linewidth=1)
 
-plt.title(rf'$T = {T}, \, N = {N}, \, \varepsilon = {Langevin.eps}$', fontsize=24)
+plt.suptitle(rf'$T = {T}, \, N = {N}, \, \varepsilon = {Langevin.eps}$', fontsize=24)
 plt.legend(fontsize=18)
 plt.xticks(fontsize=14)
-plt.yticks(fontsize=14)  
+plt.yticks(fontsize=14)
+
+plt.title(r"$V(x) = x^4/4 - x^2/2$", fontsize = 18)
 
 plt.legend()
+#plt.savefig("./figures/estimator_gaussian_process_proj_distributions.pdf", bbox_inches="tight")
 plt.show()
